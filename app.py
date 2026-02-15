@@ -7,7 +7,6 @@ import os
 
 app = FastAPI()
 
-# Load model once
 model = WhisperModel(
     "medium",
     device="cuda",
@@ -28,7 +27,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # Receive raw audio bytes
             data = await websocket.receive_bytes()
 
             chunk = np.frombuffer(data, dtype=np.int16)
@@ -40,12 +38,10 @@ async def websocket_endpoint(websocket: WebSocket):
             if len(audio_buffer) >= required_samples:
                 window = audio_buffer[-required_samples:]
 
-                # Save temporary wav
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                     wav.write(tmp.name, SAMPLE_RATE, window)
                     tmp_path = tmp.name
 
-                # Transcribe
                 segments, _ = model.transcribe(
                     tmp_path,
                     beam_size=1,
@@ -59,7 +55,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 if text:
                     await websocket.send_text(text)
 
-                # Slide buffer
                 audio_buffer = audio_buffer[step_samples:]
 
     except Exception as e:
