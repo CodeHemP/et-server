@@ -3,99 +3,116 @@ import websockets
 import json
 import numpy as np
 import torch
+import os
 from faster_whisper import WhisperModel
+import ctranslate2
+from transformers import NllbTokenizerFast
 
 # --- CONFIGURATION ---
 PORT = 8765
-# Use a slightly more robust model config
-MODEL_SIZE = "deepdml/faster-whisper-large-v3-turbo-ct2"
+WHISPER_MODEL = "deepdml/faster-whisper-large-v3-turbo-ct2"
+# We use a quantized version of NLLB for extreme speed
+TRANSLATION_MODEL = "Softcatala/nllb-200-distilled-600M-ct2-int8"
 
-print("1. Loading VAD Model...")
-# Load Silero VAD (Fast and accurate speech detection)
-vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
-                                  model='silero_vad',
-                                  force_reload=False,
-                                  onnx=True) # ONNX is faster
-(get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
-print("VAD Loaded.")
+# Language Codes for NLLB
+SRC_LANG = "eng_Latn" # English
+TARGET_LANGS = {
+    "HI": "hin_Deva", # Hindi
+    "VI": "vie_Latn", # Vietnamese
+    "DZ": "dzo_Tibt"  # Bhutanese (Dzongkha)
+}
 
-print("2. Loading Whisper Model...")
-# Run on GPU (cuda) with INT8 quantization for speed
-model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="int8_float16")
-print("Whisper Loaded! Ready for connections.")
+print("1. Loading VAD...")
+vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', onnx=True)
+(get_speech_timestamps, _, _, _, _) = utils
 
-# Prompt to guide the style
-INITIAL_PROMPT = "The following is a transcript of an Indian English speaker. The output is strictly in English."
+print("2. Loading Whisper (ASR)...")
+asr_model = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="int8_float16")
 
-def is_speech(audio_chunk, sr=16000):
-    # Silero expects a Tensor
-    audio_tensor = torch.tensor(audio_chunk)
-    # Get speech probability (0.0 to 1.0)
-    speech_prob = vad_model(audio_tensor, sr).item()
-    return speech_prob > 0.5
+print("3. Loading Translator (NLLB)...")
+# Download/Load the tokenizer
+tokenizer = NllbTokenizerFast.from_pretrained("facebook/nllb-200-distilled-600M", src_lang=SRC_LANG)
+# Load the optimized CTranslate2 translation engine
+translator = ctranslate2.Translator(TRANSLATION_MODEL, device="cuda", compute_type="int8")
 
-async def transcribe_audio(websocket):
-    print("--> Client connected")
+print(f"✅ System Ready on Port {PORT}")
+
+# Helper: Detect Speech
+def is_speech(audio_chunk):
+    tensor = torch.tensor(audio_chunk)
+    prob = vad_model(tensor, 16000).item()
+    return prob > 0.6
+
+# Helper: Translate Text
+def translate_text(text, target_lang_code):
+    if not text or len(text) < 2: return ""
     
+    # 1. Tokenize
+    source = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
+    
+    # 2. Translate (Beam size 1 for speed)
+    results = translator.translate_batch([source], target_prefix=[[target_lang_code]])
+    target = results[0].hypotheses[0]
+    
+    # 3. Decode
+    return tokenizer.decode(tokenizer.convert_tokens_to_ids(target))
+
+async def transcribe_handler(websocket):
+    print("--> User Connected")
     audio_buffer = np.array([], dtype=np.float32)
-    committed_text = ""
-    
-    # 2.5 seconds window gives better context than 2.0
     SAMPLE_RATE = 16000
-    CHUNK_DURATION = 2.5 
-    chunk_samples = int(SAMPLE_RATE * CHUNK_DURATION)
+    PROCESS_INTERVAL = 2.5 # Process every 2.5s for better context
     
     try:
         async for message in websocket:
             chunk = np.frombuffer(message, dtype=np.float32)
             audio_buffer = np.concatenate((audio_buffer, chunk))
             
-            # Only process if buffer is full enough
-            if len(audio_buffer) >= chunk_samples:
+            if len(audio_buffer) >= int(SAMPLE_RATE * PROCESS_INTERVAL):
                 
-                # --- CRITICAL FIX: VAD CHECK ---
-                # Check the last 1 second for speech. If it's silence, don't hallucinate.
-                check_window = audio_buffer[-16000:] # Check last 1 second
-                if not is_speech(check_window):
-                    # It's silence. Just clear a bit of buffer and wait.
-                    # We keep the buffer overlapping but don't run heavy inference
-                    # This prevents "The following is a transcript..." loops.
-                    audio_buffer = audio_buffer[-8000:] # Keep last 0.5s for continuity
-                    continue 
-
-                # If speech is detected, transcribe
-                segments, info = model.transcribe(
+                # VAD Check (Last 1.0s)
+                if not is_speech(audio_buffer[-16000:]):
+                    # Silence -> Trim buffer and skip
+                    audio_buffer = audio_buffer[-8000:] 
+                    continue
+                
+                # 1. Transcribe (English)
+                segments, _ = asr_model.transcribe(
                     audio_buffer, 
-                    beam_size=5, 
+                    beam_size=1, 
                     language="en",
-                    condition_on_previous_text=False, # Helps prevent loops
-                    initial_prompt=INITIAL_PROMPT,
-                    vad_filter=True, # Built-in filter as a backup
-                    vad_parameters=dict(min_silence_duration_ms=500)
+                    condition_on_previous_text=False,
+                    vad_filter=True
                 )
                 
-                text_segments = [s.text.strip() for s in segments]
-                current_text = " ".join(text_segments)
+                text_en = " ".join([s.text.strip() for s in segments if s.no_speech_prob < 0.5])
                 
-                # Send back to client
-                if current_text:
+                if text_en:
+                    # 2. Translate (Parallel)
+                    # We run translations sequentially here, but it takes <10ms on a 4090
+                    translations = {}
+                    for code, lang_id in TARGET_LANGS.items():
+                        translations[code] = translate_text(text_en, lang_id)
+                    
+                    # 3. Send Bundle
                     response = {
-                        "text": current_text,
-                        "is_final": False # Streaming mode
+                        "EN": text_en,
+                        "HI": translations["HI"],
+                        "VI": translations["VI"],
+                        "DZ": translations["DZ"]
                     }
                     await websocket.send(json.dumps(response))
                 
-                # Rolling buffer: Keep last 0.5s (8000 samples) to prevent cut words
-                audio_buffer = audio_buffer[-8000:]
-
+                # Keep last 1s context
+                audio_buffer = audio_buffer[-16000:]
+                
     except Exception as e:
         print(f"Error: {e}")
     finally:
-        print("--> Client disconnected")
+        print("--> User Disconnected")
 
 async def main():
-    async with websockets.serve(transcribe_audio, "0.0.0.0", PORT):
-        print(f"Server started on port {PORT}")
+    async with websockets.serve(transcribe_handler, "0.0.0.0", PORT):
         await asyncio.Future()
 
 if __name__ == "__main__":
