@@ -80,7 +80,6 @@ from transformers import VitsModel, AutoTokenizer as AT2
 
 tts_models = {
     "hindi":      "facebook/mms-tts-hin",
-    "nepali":     "facebook/mms-tts-npi",
     "vietnamese": "facebook/mms-tts-vie",
     "sinhala":    "facebook/mms-tts-sin",
 }
