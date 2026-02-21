@@ -80,6 +80,7 @@ from transformers import VitsModel, AutoTokenizer as AT2
 
 tts_models = {
     "hindi":      "facebook/mms-tts-hin",
+    "nepali":     "facebook/mms-tts-npi",
     "vietnamese": "facebook/mms-tts-vie",
     "sinhala":    "facebook/mms-tts-sin",
 }
@@ -96,4 +97,3 @@ print("  You can now start the server with:")
 print("    cd /workspace/realtime-translator/server")
 print("    python server.py")
 print("=" * 60)
-
